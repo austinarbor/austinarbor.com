@@ -27,14 +27,14 @@ jobs:
       - name: Print Hugo Version
         run: hugo version
 
-      - name: NPM Install
-        run: npm install
+      - name: Mod Tidy
+        run: hugo mod tidy
 
       - name: NPM Pack
         run: hugo mod npm pack
-      
-      - name: Mod Tidy
-        run: hugo mod tidy
+
+      - name: NPM Install
+        run: npm install
 
       - name: Build Site
         run: hugo build
