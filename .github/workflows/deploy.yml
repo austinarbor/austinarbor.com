@@ -1,0 +1,66 @@
+name: Deploy Website
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20.8.0'
+
+      - name: Install Latest Hugo Release
+        run: |
+          download_info=$(curl --silent -X GET -L https://api.github.com/repos/gohugoio/hugo/releases/latest | jq '.assets[] | select(.name | startswith("hugo_extended_withdeploy") and endswith("linux-amd64.deb")) | { name: .name, url: .browser_download_url }')
+          download_url=$(echo "${download_info}" | jq -r '.url')
+          wget -O hugo.deb "${download_url}"
+          sudo apt install ./hugo.deb
+
+      - name: Print Hugo Version
+        run: hugo version
+
+      - name: NPM Install
+        run: npm install
+
+      - name: NPM Pack
+        run: hugo mod npm pack
+      
+      - name: Mod Tidy
+        run: hugo mod tidy
+
+      - name: Build Site
+        run: hugo build
+
+      - name: Get Public IP
+        id: public-ip
+        run: |
+          ip_addr=$(curl https://api.ipify.org/?format=json)
+          ip=$(echo "${ip_addr}" | jq --raw-output '.ip')
+          echo "RUNNER_IP_ADDRESS=${ip}" >> "$GITHUB_OUTPUT"
+
+      - name: Add Firewall Rule
+        uses: adnanjaw/ip-whitelist-on-hetznerfw@v2
+        with:
+          hetzner_api_key: ${{ secrets.HETZNER_API_TOKEN }}
+          firewall_name: ${{ secrets.HETZNER_FIREWALL_NAME }}
+          ip_address: ${{ steps.public-ip.outputs.RUNNER_IP_ADDRESS }}
+          protocol: tcp
+          port: 21-22
+
+      - uses: appleboy/scp-action@v1.0.0
+        name: Deploy Score Service
+        with:
+          host: ${{ secrets.SCP_IP_ADDRESS }}
+          username: ${{ secrets.SCP_USERNAME }}
+          key: ${{ secrets.SCP_PRIVATE_KEY }}
+          source: public
+          target: /var/www/test
+          strip_components: 1
