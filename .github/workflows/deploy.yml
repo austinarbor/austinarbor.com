@@ -1,7 +1,6 @@
 name: Deploy Website
 on:
   workflow_dispatch:
-  pull_request:
 
 jobs:
   deploy:
@@ -56,11 +55,11 @@ jobs:
           port: 21-22
 
       - uses: appleboy/scp-action@v1.0.0
-        name: Deploy Score Service
+        name: Deploy Website
         with:
           host: ${{ secrets.SCP_IP_ADDRESS }}
           username: ${{ secrets.SCP_USERNAME }}
           key: ${{ secrets.SCP_PRIVATE_KEY }}
           source: public
-          target: /var/www/test
+          target: /var/www/html
           strip_components: 1
