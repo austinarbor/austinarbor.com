@@ -22,6 +22,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     outputs:
+      version: ${{ steps.version.outputs.VERSION }}
       commit: ${{ steps.version.outputs.COMMIT }}
     steps:
       - name: Get Public IP
@@ -42,18 +43,25 @@ jobs:
           protocol: tcp
           port: 21-22
 
+      # fetch-depth: 0 so git describe can find the nearest release tag
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           ref: ${{ inputs.ref || github.ref }}
 
-      # the site has no release tags, so the commit is its version
+      # a release tag describes as itself (1.0.0); anything else as the nearest release tag plus
+      # commits since and the sha (1.0.0-3-gabc1234), so branch deploys label themselves
       - name: Resolve version
         id: version
         run: |
+          version=$(git describe --tags --match '[0-9]*.[0-9]*.[0-9]*') || {
+            echo "::error::no release tag reachable from $(git rev-parse HEAD)"
+            exit 1
+          }
+          echo "VERSION=${version}" >> "$GITHUB_OUTPUT"
           # github.sha is the dispatching commit, not necessarily the ref deployed
-          commit=$(git rev-parse HEAD)
-          echo "COMMIT=${commit}" >> "$GITHUB_OUTPUT"
-          echo "deploying ${commit}"
+          echo "COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "deploying ${version}"
 
       # hugo modules (the toha theme) are go modules
       - uses: actions/setup-go@v6
@@ -82,14 +90,14 @@ jobs:
           hugo mod npm pack
           npm install
 
-      # version.txt says which commit is live: https://austinarbor.com/version.txt
+      # version.txt says which version is live: https://austinarbor.com/version.txt
       - name: Build Site
         env:
-          COMMIT: ${{ steps.version.outputs.COMMIT }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
           hugo --gc --minify --logLevel error
           test -f public/index.html
-          echo "${COMMIT}" > public/version.txt
+          echo "${VERSION}" > public/version.txt
 
       # into a folder beside the live one, swapped in below, so a failed copy can't leave half a
       # site being served. rm clears what a failed earlier deploy may have left there
@@ -107,17 +115,17 @@ jobs:
       - uses: appleboy/ssh-action@v1.2.5
         name: Swap In
         env:
-          COMMIT: ${{ steps.version.outputs.COMMIT }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
         with:
           host: ${{ secrets.SCP_IP_ADDRESS }}
           username: ${{ secrets.SCP_USERNAME }}
           key: ${{ secrets.SCP_PRIVATE_KEY }}
-          envs: COMMIT
+          envs: VERSION
           script: |
             set -e
             cd /var/www
-            if ! grep -qxF "$COMMIT" incoming/version.txt; then
-              echo "::error::incoming/ isn't $COMMIT; the live site wasn't touched"
+            if ! grep -qxF "$VERSION" incoming/version.txt; then
+              echo "::error::incoming/ isn't $VERSION; the live site wasn't touched"
               exit 1
             fi
             if [ -d html ]; then
@@ -138,5 +146,5 @@ jobs:
             rm -rf html.previous
             if [ -d html ]; then mv html html.previous; fi
             mv incoming html
-            grep -qxF "$COMMIT" html/version.txt
-            echo "deployed $COMMIT"
+            grep -qxF "$VERSION" html/version.txt
+            echo "deployed $VERSION"
