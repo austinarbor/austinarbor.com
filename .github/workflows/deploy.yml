@@ -1,49 +1,30 @@
 name: Deploy Website
+run-name: Deploy Website - ${{ inputs.ref || github.ref_name }}
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Ref to build and deploy; defaults to the triggering ref'
+        required: false
+        type: string
+
+# one deploy at a time: a second waits rather than swapping the site out from under the first
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  # pinned so a new hugo release can't break a deploy; the theme needs >= 0.163
+  HUGO_VERSION: 0.170.1
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      commit: ${{ steps.version.outputs.COMMIT }}
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
-      # the theme's npm dependencies require node >= 22.12
-      - uses: actions/setup-node@v6
-        with:
-          node-version: lts/*
-
-      - name: Install Latest Hugo Release
-        run: |
-          download_url=$(curl -fsSL https://api.github.com/repos/gohugoio/hugo/releases/latest \
-            | jq -r '.assets[] | select(.name | test("^hugo_extended_[0-9.]+_linux-amd64\\.deb$")) | .browser_download_url')
-          wget -qO hugo.deb "${download_url}"
-          sudo apt-get install -y ./hugo.deb
-          rm hugo.deb
-
-      # the theme compiles its SCSS with Dart Sass, which Hugo does not bundle
-      - name: Install Dart Sass
-        run: sudo snap install dart-sass
-
-      - name: Print Hugo Version
-        run: hugo version
-
-      - name: Mod Tidy
-        run: hugo mod tidy
-
-      - name: NPM Pack
-        run: hugo mod npm pack
-
-      - name: NPM Install
-        run: npm install
-
-      - name: Build Site
-        run: hugo build
-
       - name: Get Public IP
         id: public-ip
         run: |
@@ -51,6 +32,8 @@ jobs:
           ip=$(echo "${ip_addr}" | jq --raw-output '.ip')
           echo "RUNNER_IP_ADDRESS=${ip}" >> "$GITHUB_OUTPUT"
 
+      # the server's Hetzner firewall lets ssh in only from known addresses; the rule is removed
+      # again when the job ends (the action's cleanup)
       - name: Add Firewall Rule
         uses: adnanjaw/ip-whitelist-on-hetznerfw@v2
         with:
@@ -60,12 +43,108 @@ jobs:
           protocol: tcp
           port: 21-22
 
+      # fetch-depth: 0 so git describe can find the nearest release tag
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
+
+      # a release tag describes as itself (1.0.0); anything else as the nearest release tag plus
+      # commits since and the sha (1.0.0-3-gabc1234), so branch deploys label themselves
+      - name: Resolve version
+        id: version
+        run: |
+          version=$(git describe --tags --match '[0-9]*.[0-9]*.[0-9]*') || {
+            echo "::error::no release tag reachable from $(git rev-parse HEAD)"
+            exit 1
+          }
+          echo "VERSION=${version}" >> "$GITHUB_OUTPUT"
+          # github.sha is the dispatching commit, not necessarily the ref deployed
+          echo "COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "deploying ${version}"
+
+      # hugo modules (the toha theme) are go modules
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # the theme's npm dependencies require node >= 22.12
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: lts/*
+
+      - name: Install Hugo
+        run: |
+          wget -qO hugo.deb "https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_extended_${HUGO_VERSION}_linux-amd64.deb"
+          sudo apt-get install -y ./hugo.deb
+          rm hugo.deb
+          hugo version
+
+      # the theme compiles its SCSS with Dart Sass, which hugo does not bundle
+      - name: Install Dart Sass
+        run: sudo snap install dart-sass
+
+      # package.json is generated from the theme's dependencies, not checked in
+      - name: Install Theme Dependencies
+        run: |
+          hugo mod npm pack
+          npm install
+
+      # version.txt says which version is live: https://austinarbor.com/version.txt
+      - name: Build Site
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          hugo --gc --minify --logLevel error
+          test -f public/index.html
+          echo "${VERSION}" > public/version.txt
+
+      # into a folder beside the live one, swapped in below, so a failed copy can't leave half a
+      # site being served. rm clears what a failed earlier deploy may have left there
       - uses: appleboy/scp-action@v1.0.0
-        name: Deploy Website
+        name: Copy Site
         with:
           host: ${{ secrets.SCP_IP_ADDRESS }}
           username: ${{ secrets.SCP_USERNAME }}
           key: ${{ secrets.SCP_PRIVATE_KEY }}
           source: public
-          target: /var/www/html
+          target: /var/www/incoming
           strip_components: 1
+          rm: true
+
+      - uses: appleboy/ssh-action@v1.2.5
+        name: Swap In
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        with:
+          host: ${{ secrets.SCP_IP_ADDRESS }}
+          username: ${{ secrets.SCP_USERNAME }}
+          key: ${{ secrets.SCP_PRIVATE_KEY }}
+          envs: VERSION
+          script: |
+            set -e
+            cd /var/www
+            if ! grep -qxF "$VERSION" incoming/version.txt; then
+              echo "::error::incoming/ isn't $VERSION; the live site wasn't touched"
+              exit 1
+            fi
+            if [ -d html ]; then
+              # same owner and mode as the live site, so the web server can still read it
+              chown -R --reference=html incoming
+              chmod --reference=html incoming
+              # the swap replaces the whole folder; list anything that isn't part of this build
+              # (it's kept in html.previous until the next deploy). fingerprinted css/js
+              # (application.<sha256>.css) change name every build, so they're left out
+              extra=$(cd html && find . -type f | grep -vE '\.[0-9a-f]{64}\.' \
+                | while read -r f; do [ -e "../incoming/$f" ] || echo "$f"; done)
+              if [ -n "$extra" ]; then
+                echo "::warning::not in this build, left in /var/www/html.previous:"
+                echo "$extra"
+              fi
+            fi
+            # the live site is kept, to go back to: mv html html.bad && mv html.previous html
+            rm -rf html.previous
+            if [ -d html ]; then mv html html.previous; fi
+            mv incoming html
+            grep -qxF "$VERSION" html/version.txt
+            echo "deployed $VERSION"

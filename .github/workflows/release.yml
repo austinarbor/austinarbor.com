@@ -1,0 +1,70 @@
+name: Tag and Release
+run-name: Tag and Release ${{ inputs.version }}${{ inputs.deploy && ' (with deploy)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release/tag name: a semver version, MAJOR.MINOR.PATCH, e.g. 1.0.0'
+        required: true
+        type: string
+      deploy:
+        description: 'Also run the Deploy Website workflow against the new tag'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      ACTOR: ${{ github.actor }}
+      # nothing here needs the release to trigger another workflow (the deploy is called below),
+      # so the workflow's own token will do
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # fetch-depth: 0 so the Makefile's "tag already exists locally" guard sees existing tags
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # semver, without a v: 0.0.1, 0.1.0, 1.0.0 (Deploy's git describe finds tags of this shape)
+      - name: Validate version
+        run: |
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::invalid version '$VERSION' (semver MAJOR.MINOR.PATCH, e.g. 1.0.0)"
+            exit 1
+          fi
+
+      # workflow_dispatch has no branch filter, so enforce it here: a tag cut from any other
+      # branch points at a commit main may never contain (e.g. after a squash merge)
+      - name: Require main
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::releases must be run from main, not '$GITHUB_REF'"
+            exit 1
+          fi
+
+      - name: Configure git identity
+        run: |
+          git config user.name "$ACTOR"
+          git config user.email "$ACTOR@users.noreply.github.com"
+
+      - name: Release
+        run: make release VERSION="$VERSION"
+
+  # A called workflow inherits the caller's github context (GITHUB_REF/GITHUB_SHA
+  # are "same as the caller workflow"), so deploy.yml cannot work out the tag on
+  # its own -- pass it explicitly. Expressions are not allowed in "uses", so the
+  # ref cannot be pinned there either.
+  deploy:
+    needs: release
+    if: inputs.deploy
+    uses: ./.github/workflows/deploy.yml
+    with:
+      ref: ${{ inputs.version }}
+    secrets: inherit
